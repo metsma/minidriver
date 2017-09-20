@@ -110,12 +110,10 @@ typedef struct
 	RSAPUBKEY rsapubkey;
 } PUBKEYSTRUCT, *PPUBKEYSTRUCT;
 
-typedef struct
-{
-	HWND hwndParentWindow, windowHandle;
-	PIN_ID pinId;
-	LANGID langId;
-} EXTERNAL_INFO, *PEXTERNAL_INFO;
+struct Result {
+	byte SW1, SW2; vector<byte> data;
+	bool operator !() const { return !(SW1 == 0x90 && SW2 == 0x00); }
+};
 
 struct Files
 {
@@ -123,11 +121,8 @@ struct Files
 	BYTE cardid[16];
 	PCCERT_CONTEXT auth, sign;
 	HWND cp;
-};
-
-struct Result {
-	byte SW1, SW2; vector<byte> data;
-	bool operator !() const { return !(SW1 == 0x90 && SW2 == 0x00); }
+	HWND windowHandle;
+	Result result;
 };
 
 static void log(const char *functionName, const char *fileName, int lineNumber, string message, ...)
@@ -424,20 +419,19 @@ static bool isPinPad(PCARD_DATA pCardData)
 	return f.find(FEATURE_VERIFY_PIN_DIRECT) != f.cend() || f.find(FEATURE_VERIFY_PIN_START) != f.cend();
 }
 
-DWORD WINAPI CreateProgressBar(LPVOID lpParam)
+DWORD WINAPI CreateProgressBar(HWND parentWindow, PIN_ID pinId, LANGID langId, int *button, HWND *windowHandle)
 {
-	PEXTERNAL_INFO externalInfo = PEXTERNAL_INFO(lpParam);
 	TASKDIALOGCONFIG config = { 0 };
 	config.cbSize = sizeof(config);
-	config.hwndParent = externalInfo->hwndParentWindow;
+	config.hwndParent = parentWindow;
 	config.hInstance = GetModuleHandle(NULL);
 	config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
 	config.pszMainIcon = TD_INFORMATION_ICON;
 	config.dwFlags = TDF_EXPAND_FOOTER_AREA | TDF_SHOW_PROGRESS_BAR | TDF_CALLBACK_TIMER;
-	config.lpCallbackData = LONG_PTR(externalInfo);
+	config.lpCallbackData = LONG_PTR(windowHandle);
 	config.pfCallback = [](HWND hwnd, UINT uNotification, WPARAM wParam, LPARAM lParam, LONG_PTR dwRefData) {
-		PEXTERNAL_INFO externalInfo = PEXTERNAL_INFO(dwRefData);
-		externalInfo->windowHandle = hwnd;
+		HWND *windowHandle = (HWND*)dwRefData;
+		*windowHandle = hwnd;
 		switch (uNotification)
 		{
 		case TDN_CREATED:
@@ -454,12 +448,12 @@ DWORD WINAPI CreateProgressBar(LPVOID lpParam)
 		}
 		return S_OK;
 	};
-	switch (PRIMARYLANGID(externalInfo->langId))
+	switch (PRIMARYLANGID(langId))
 	{
 	case LANG_ESTONIAN:
 		config.pszMainInstruction = L"PIN Pad kaardilugeja";
 		config.pszContent = L"Sisestage PIN";
-		switch (externalInfo->pinId)
+		switch (pinId)
 		{
 		case AUTH_PIN_ID:
 			config.pszContent = L"Palun sisestage autoriseerimise PIN (PIN1)";
@@ -475,7 +469,7 @@ DWORD WINAPI CreateProgressBar(LPVOID lpParam)
 	case LANG_RUSSIAN:
 		config.pszMainInstruction = L"PIN Pad считыватель";
 		config.pszContent = L"Введите PIN код";
-		switch (externalInfo->pinId)
+		switch (pinId)
 		{
 		case AUTH_PIN_ID:
 			config.pszContent = L"Введите код PIN для идентификации (PIN 1)";
@@ -491,7 +485,7 @@ DWORD WINAPI CreateProgressBar(LPVOID lpParam)
 	default:
 		config.pszMainInstruction = L"PIN Pad Reader";
 		config.pszContent = L"Enter PIN code";
-		switch (externalInfo->pinId)
+		switch (pinId)
 		{
 		case AUTH_PIN_ID:
 			config.pszContent = L"Enter PIN for authentication (PIN 1)";
@@ -506,7 +500,7 @@ DWORD WINAPI CreateProgressBar(LPVOID lpParam)
 		break;
 	}
 	_log("Create Progress Dialog");
-	return TaskDialogIndirect(&config, nullptr, nullptr, nullptr);
+	return TaskDialogIndirect(&config, button, nullptr, nullptr);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
@@ -1038,6 +1032,7 @@ DWORD WINAPI CardAuthenticateEx(__in PCARD_DATA pCardData, __in PIN_ID PinId, __
 			RETURN(SCARD_E_INVALID_PARAMETER);
 
 		Files *files = (Files*)pCardData->pvVendorSpecific;
+		LANGID langId = GetUserDefaultUILanguage();
 		PWCHAR label = PinId == AUTH_PIN_ID ? L"Authentication error" : L"Signing error";
 		if (remaining == 0)
 		{
@@ -1045,22 +1040,24 @@ DWORD WINAPI CardAuthenticateEx(__in PCARD_DATA pCardData, __in PIN_ID PinId, __
 			RETURN(SCARD_W_CHV_BLOCKED);
 		}
 
-		EXTERNAL_INFO externalInfo;
-		externalInfo.hwndParentWindow = files->cp;
-		externalInfo.windowHandle = 0;
-		externalInfo.pinId = PinId;
-		externalInfo.langId = GetUserDefaultUILanguage();
-
 		while (remaining)
 		{
 			_log("Authenticating with PinPAD");
-			HANDLE thread = CreateThread(NULL, 0, CreateProgressBar, &externalInfo, 0, NULL);
-			Result result = transferCTL({ 0x00, 0x20, 0x00, byte(PinId == AUTH_PIN_ID ? 1 : 2), 0x00 },
-				true, externalInfo.langId, PinId == AUTH_PIN_ID ? 4 : 5, pCardData->hScard);
-			SendMessage(externalInfo.windowHandle, WM_NCDESTROY, 0, 0);
-			WaitForSingleObject(thread, INFINITE);
-			CloseHandle(thread);
-			switch ((uint8_t(result.SW1) << 8) + uint8_t(result.SW2))
+			files->windowHandle = 0;
+			std::thread([=] {
+				files->result = transferCTL({ 0x00, 0x20, 0x00, byte(PinId == AUTH_PIN_ID ? 1 : 2), 0x00 },
+					true, langId, PinId == AUTH_PIN_ID ? 4 : 5, pCardData->hScard);
+				if (files->windowHandle)
+					SendMessage(files->windowHandle, WM_NCDESTROY, 0, 0);
+			}).detach();
+			int button = 0;
+			CreateProgressBar(files->cp, PinId, langId, &button, &files->windowHandle);
+			if (button == IDCANCEL)
+			{
+				files->windowHandle = 0;
+				RETURN(SCARD_W_CANCELLED_BY_USER);
+			}
+			switch ((uint8_t(files->result.SW1) << 8) + uint8_t(files->result.SW2))
 			{
 			case 0x9000: RETURN(NO_ERROR);
 			case 0x63C0: //pin retry count 0
